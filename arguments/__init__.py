@@ -123,6 +123,9 @@ class OptimizationParams(ParamGroup):
         self.significance_prune = True
         self.min_contribution = 0.001
 
+        self.batch_size = 1
+        self.batch_grad_accum = True
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

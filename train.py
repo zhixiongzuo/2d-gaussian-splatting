@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -11,7 +11,7 @@
 
 import os
 import torch
-from random import randint
+from random import randint, sample
 from utils.loss_utils import l1_loss, ssim, fast_ssim
 from gaussian_renderer import render, network_gui
 import sys
@@ -73,6 +73,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     ssim_func = fast_ssim if opt.fast_ssim else ssim
 
+    batch_size = opt.batch_size
+    use_batch = batch_size > 1 and opt.batch_grad_accum
+
     if opt.coarse_to_fine:
         print(f"[Coarse-to-Fine] Schedule: {c2f_schedule}, Iters: {c2f_iters}")
     if opt.global_local:
@@ -94,10 +97,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print(f"[Edge-Guided Densification] threshold_ratio={opt.edge_threshold_ratio}")
     if opt.significance_prune:
         print(f"[Significance Pruning] min_contribution={opt.min_contribution}")
+    if use_batch:
+        print(f"[Batch Training] batch_size={batch_size}, grad_accum=True")
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):
 
         iter_start.record()
 
@@ -108,37 +113,116 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
-        if opt.coarse_to_fine:
-            current_scale = get_coarse_to_fine_scale(iteration, c2f_schedule, c2f_iters)
-            closest_scale = min(resolution_scales, key=lambda s: abs(s - current_scale))
-            if closest_scale in scene.train_cameras:
-                scaled_cams = scene.getTrainCameras(closest_scale)
-                if scaled_cams:
-                    viewpoint_cam = scaled_cams[randint(0, len(scaled_cams)-1)]
-        
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        if use_batch:
+            n_sample = min(batch_size, len(viewpoint_stack))
+            indices = sample(range(len(viewpoint_stack)), n_sample)
+            batch_cams = [viewpoint_stack[i] for i in sorted(indices, reverse=True)]
+            for i in sorted(indices, reverse=True):
+                viewpoint_stack.pop(i)
 
-        
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_func(image, gt_image))
-        
-        lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
-        lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
+            if opt.coarse_to_fine:
+                current_scale = get_coarse_to_fine_scale(iteration, c2f_schedule, c2f_iters)
+                closest_scale = min(resolution_scales, key=lambda s: abs(s - current_scale))
+                if closest_scale in scene.train_cameras:
+                    scaled_cams = scene.getTrainCameras(closest_scale)
+                    if scaled_cams:
+                        batch_cams = sample(scaled_cams, min(n_sample, len(scaled_cams)))
 
-        rend_dist = render_pkg["rend_dist"]
-        rend_normal  = render_pkg['rend_normal']
-        surf_normal = render_pkg['surf_normal']
-        normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
-        normal_loss = lambda_normal * (normal_error).mean()
-        dist_loss = lambda_dist * (rend_dist).mean()
+            total_loss = torch.tensor(0.0, device="cuda", requires_grad=True)
+            batch_Ll1 = 0.0
+            batch_loss = 0.0
+            batch_dist_loss = 0.0
+            batch_normal_loss = 0.0
 
-        total_loss = loss + dist_loss + normal_loss
-        
-        total_loss.backward()
+            last_render_pkg = None
+            last_viewpoint_cam = None
+
+            for cam_idx, viewpoint_cam in enumerate(batch_cams):
+                render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+                image = render_pkg["render"]
+                viewspace_point_tensor = render_pkg["viewspace_points"]
+                visibility_filter = render_pkg["visibility_filter"]
+                radii = render_pkg["radii"]
+
+                gt_image = viewpoint_cam.original_image.cuda()
+                Ll1 = l1_loss(image, gt_image)
+                loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_func(image, gt_image))
+
+                lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
+                lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
+
+                rend_dist = render_pkg["rend_dist"]
+                rend_normal = render_pkg['rend_normal']
+                surf_normal = render_pkg['surf_normal']
+                normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
+                normal_loss = lambda_normal * (normal_error).mean()
+                dist_loss = lambda_dist * (rend_dist).mean()
+
+                view_loss = loss + dist_loss + normal_loss
+                total_loss = total_loss + view_loss / n_sample
+
+                batch_Ll1 += Ll1.item()
+                batch_loss += loss.item()
+                batch_dist_loss += dist_loss.item()
+                batch_normal_loss += normal_loss.item()
+
+                if iteration < opt.densify_until_iter:
+                    gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+
+                last_render_pkg = render_pkg
+                last_viewpoint_cam = viewpoint_cam
+
+            total_loss.backward()
+
+            batch_Ll1 /= n_sample
+            batch_loss /= n_sample
+            batch_dist_loss /= n_sample
+            batch_normal_loss /= n_sample
+
+            image = last_render_pkg["render"]
+            viewspace_point_tensor = last_render_pkg["viewspace_points"]
+            visibility_filter = last_render_pkg["visibility_filter"]
+            radii = last_render_pkg["radii"]
+            viewpoint_cam = last_viewpoint_cam
+            Ll1 = torch.tensor(batch_Ll1)
+            loss = torch.tensor(batch_loss)
+            dist_loss = torch.tensor(batch_dist_loss)
+            normal_loss = torch.tensor(batch_normal_loss)
+
+        else:
+            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+
+            if opt.coarse_to_fine:
+                current_scale = get_coarse_to_fine_scale(iteration, c2f_schedule, c2f_iters)
+                closest_scale = min(resolution_scales, key=lambda s: abs(s - current_scale))
+                if closest_scale in scene.train_cameras:
+                    scaled_cams = scene.getTrainCameras(closest_scale)
+                    if scaled_cams:
+                        viewpoint_cam = scaled_cams[randint(0, len(scaled_cams)-1)]
+
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+            image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
+
+            gt_image = viewpoint_cam.original_image.cuda()
+            Ll1 = l1_loss(image, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_func(image, gt_image))
+
+            lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
+            lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
+
+            rend_dist = render_pkg["rend_dist"]
+            rend_normal  = render_pkg['rend_normal']
+            surf_normal = render_pkg['surf_normal']
+            normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
+            normal_loss = lambda_normal * (normal_error).mean()
+            dist_loss = lambda_dist * (rend_dist).mean()
+
+            total_loss = loss + dist_loss + normal_loss
+
+            total_loss.backward()
 
         iter_end.record()
 
@@ -154,6 +238,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "normal": f"{ema_normal_for_log:.{5}f}",
                     "Points": f"{len(gaussians.get_xyz)}"
                 }
+                if use_batch:
+                    loss_dict["Batch"] = str(batch_size)
                 progress_bar.set_postfix(loss_dict)
 
                 progress_bar.update(10)
@@ -171,8 +257,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
             if iteration < opt.densify_until_iter:
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                if not use_batch:
+                    gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     use_vcd = opt.vcd
@@ -286,7 +373,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-        with torch.no_grad():        
+        with torch.no_grad():
             if network_gui.conn == None:
                 network_gui.try_connect(dataset.render_items)
             while network_gui.conn != None:
@@ -294,7 +381,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     net_image_bytes = None
                     custom_cam, do_training, keep_alive, scaling_modifer, render_mode = network_gui.receive()
                     if custom_cam != None:
-                        render_pkg = render(custom_cam, gaussians, pipe, background, scaling_modifer)   
+                        render_pkg = render(custom_cam, gaussians, pipe, background, scaling_modifer)
                         net_image = render_net_image(render_pkg, dataset.render_items, render_mode, custom_cam)
                         net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                     metrics_dict = {
@@ -307,14 +394,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 except Exception as e:
                     network_gui.conn = None
 
-def prepare_output_and_logger(args):    
+def prepare_output_and_logger(args):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid1())
         args.model_path = os.path.join("./output/", unique_str[0:10])
-        
+
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
     with open(os.path.join(args.model_path, 'cfg_args'), 'w') as cfg_log_f:
@@ -337,7 +424,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
+        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()},
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
         for config in validation_configs:
@@ -401,7 +488,7 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
-    
+
     print("Optimizing " + args.model_path)
 
     safe_state(args.quiet)

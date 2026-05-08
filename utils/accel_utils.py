@@ -60,9 +60,7 @@ def compute_vcd_score(gaussians_xyz, gaussians_opacity, radii, visibility_filter
         gt_image = camera.original_image.cuda()
         error_map = (rendered - gt_image).abs().mean(dim=0)
         high_error = (error_map > error_threshold).float().unsqueeze(0).unsqueeze(0)
-        kernel_size = 7
-        padding = kernel_size // 2
-        high_error_density = F.avg_pool2d(high_error, kernel_size=kernel_size, stride=1, padding=padding).squeeze()
+        high_error_density = F.avg_pool2d(high_error, kernel_size=7, stride=1, padding=3).squeeze()
         viewspace_points = render_pkg["viewspace_points"]
         cam_radii = render_pkg["radii"].float()
         cam_visibility = render_pkg["visibility_filter"]
@@ -74,6 +72,7 @@ def compute_vcd_score(gaussians_xyz, gaussians_opacity, radii, visibility_filter
         vis = cam_visibility
         score[vis] += local_density[vis] * area[vis]
         view_count[vis] += 1
+        del render_pkg, rendered, error_map, high_error, high_error_density
     valid = view_count > 0
     score[valid] /= view_count[valid]
     return score
@@ -96,9 +95,7 @@ def compute_vcp_score(gaussians_xyz, gaussians_opacity, radii, visibility_filter
         gt_image = camera.original_image.cuda()
         error_map = (rendered - gt_image).abs().mean(dim=0)
         high_error = (error_map > error_threshold).float().unsqueeze(0).unsqueeze(0)
-        kernel_size = 7
-        padding = kernel_size // 2
-        high_error_density = F.avg_pool2d(high_error, kernel_size=kernel_size, stride=1, padding=padding).squeeze()
+        high_error_density = F.avg_pool2d(high_error, kernel_size=7, stride=1, padding=3).squeeze()
         viewspace_points = render_pkg["viewspace_points"]
         cam_radii = render_pkg["radii"].float()
         cam_visibility = render_pkg["visibility_filter"]
@@ -109,6 +106,7 @@ def compute_vcp_score(gaussians_xyz, gaussians_opacity, radii, visibility_filter
         vis = cam_visibility
         score[vis] += local_density[vis] * (1.0 - opacity[vis])
         view_count[vis] += 1
+        del render_pkg, rendered, error_map, high_error, high_error_density
     valid = view_count > 0
     score[valid] /= view_count[valid]
     return score
