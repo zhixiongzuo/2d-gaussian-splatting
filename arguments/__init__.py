@@ -125,6 +125,7 @@ class OptimizationParams(ParamGroup):
 
         self.batch_size = 1
         self.batch_grad_accum = True
+        self.vram_limit = 0.90
 
         super().__init__(parser, "Optimization Parameters")
 

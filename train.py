@@ -75,6 +75,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     batch_size = opt.batch_size
     use_batch = batch_size > 1 and opt.batch_grad_accum
+    vram_limit = opt.vram_limit
+    adaptive_batch = use_batch and vram_limit < 1.0
+    current_batch_size = batch_size
 
     if opt.coarse_to_fine:
         print(f"[Coarse-to-Fine] Schedule: {c2f_schedule}, Iters: {c2f_iters}")
@@ -98,7 +101,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if opt.significance_prune:
         print(f"[Significance Pruning] min_contribution={opt.min_contribution}")
     if use_batch:
-        print(f"[Batch Training] batch_size={batch_size}, grad_accum=True")
+        mode_str = "adaptive" if adaptive_batch else "fixed"
+        print(f"[Batch Training] batch_size={batch_size}, mode={mode_str}, vram_limit={vram_limit:.0%}")
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -115,7 +119,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_stack = scene.getTrainCameras().copy()
 
         if use_batch:
-            n_sample = min(batch_size, len(viewpoint_stack))
+            if adaptive_batch and iteration % 100 == 0:
+                vram_used = torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory
+                if vram_used > vram_limit and current_batch_size > 1:
+                    current_batch_size = max(1, current_batch_size - 1)
+                    if current_batch_size == 1:
+                        use_batch = False
+                    print(f"[Adaptive Batch] VRAM {vram_used:.1%} > {vram_limit:.0%}, reducing batch_size to {current_batch_size}")
+                elif vram_used < vram_limit * 0.7 and current_batch_size < batch_size:
+                    current_batch_size = min(batch_size, current_batch_size + 1)
+                    print(f"[Adaptive Batch] VRAM {vram_used:.1%} < {vram_limit*0.7:.0%}, increasing batch_size to {current_batch_size}")
+
+        if use_batch:
+            n_sample = min(current_batch_size, len(viewpoint_stack))
             indices = sample(range(len(viewpoint_stack)), n_sample)
             batch_cams = [viewpoint_stack[i] for i in sorted(indices, reverse=True)]
             for i in sorted(indices, reverse=True):
@@ -129,14 +145,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if scaled_cams:
                         batch_cams = sample(scaled_cams, min(n_sample, len(scaled_cams)))
 
-            total_loss = torch.tensor(0.0, device="cuda", requires_grad=True)
             batch_Ll1 = 0.0
             batch_loss = 0.0
             batch_dist_loss = 0.0
             batch_normal_loss = 0.0
 
-            last_render_pkg = None
             last_viewpoint_cam = None
+            last_image = None
+            last_radii = None
+            last_visibility_filter = None
 
             for cam_idx, viewpoint_cam in enumerate(batch_cams):
                 render_pkg = render(viewpoint_cam, gaussians, pipe, background)
@@ -159,8 +176,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 normal_loss = lambda_normal * (normal_error).mean()
                 dist_loss = lambda_dist * (rend_dist).mean()
 
-                view_loss = loss + dist_loss + normal_loss
-                total_loss = total_loss + view_loss / n_sample
+                view_loss = (loss + dist_loss + normal_loss) / n_sample
+                view_loss.backward()
 
                 batch_Ll1 += Ll1.item()
                 batch_loss += loss.item()
@@ -171,21 +188,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                     gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                last_render_pkg = render_pkg
                 last_viewpoint_cam = viewpoint_cam
-
-            total_loss.backward()
+                last_image = image.detach()
+                last_radii = radii.detach()
+                last_visibility_filter = visibility_filter.detach()
 
             batch_Ll1 /= n_sample
             batch_loss /= n_sample
             batch_dist_loss /= n_sample
             batch_normal_loss /= n_sample
 
-            image = last_render_pkg["render"]
-            viewspace_point_tensor = last_render_pkg["viewspace_points"]
-            visibility_filter = last_render_pkg["visibility_filter"]
-            radii = last_render_pkg["radii"]
             viewpoint_cam = last_viewpoint_cam
+            image = last_image
+            radii = last_radii
+            visibility_filter = last_visibility_filter
             Ll1 = torch.tensor(batch_Ll1)
             loss = torch.tensor(batch_loss)
             dist_loss = torch.tensor(batch_dist_loss)
