@@ -173,7 +173,7 @@ def compute_edge_guided_densify_mask(gaussians, rendered_image, grads, grad_thre
 
 def compute_significance_prune_mask(gaussians, radii, min_contribution=0.001, min_opacity=0.1):
     area = math.pi * radii ** 2
-    opacity = gaussians.get_opacity().squeeze()
+    opacity = gaussians.get_opacity.squeeze()
     contribution = area * opacity
     prune_mask = torch.logical_and(
         contribution < min_contribution,
