@@ -1,14 +1,3 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
-
 from argparse import ArgumentParser, Namespace
 import sys
 import os
@@ -92,6 +81,35 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
+
+        self._fast_ssim = True
+        self._z_ordering = True
+        self.z_ordering_interval = 1000
+        self.splat_bounding = True
+        self.splat_bounding_ratio = 10.0
+        self._vcd = False
+        self.vcd_K = 3
+        self.vcd_error_threshold = 0.2
+        self.vcd_score_threshold = 0.5
+        self._vcp = False
+        self.vcp_K = 3
+        self.vcp_error_threshold = 0.2
+        self.vcp_score_threshold = 1.0
+        self._global_local = False
+        self.global_local_switch_iter = 7000
+        self._coarse_to_fine = False
+        self.coarse_to_fine_schedule = "0.25,0.5,1.0"
+        self.coarse_to_fine_iters = "3000,7000,15000"
+        self.scale_scheduler = True
+        self.scale_scheduler_start = 5000
+        self.scale_cap = 0.08
+        self.long_axis_split = True
+        self.edge_guided_densify = False
+        self.edge_threshold_ratio = 0.3
+        self.significance_prune = True
+        self.min_contribution = 0.001
+        self.min_opacity_prune = 0.005
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
