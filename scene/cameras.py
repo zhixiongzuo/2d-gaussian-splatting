@@ -58,6 +58,16 @@ class Camera(nn.Module):
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
+    def project_to_image(self, points_3d):
+        ones = torch.ones(points_3d.shape[0], 1, device=points_3d.device)
+        pts_h = torch.cat([points_3d, ones], dim=1)
+        pts_clip = (self.full_proj_transform.unsqueeze(0) @ pts_h.unsqueeze(-1)).squeeze(-1)
+        w = pts_clip[:, 3:4].clamp(min=1e-7)
+        pts_ndc = pts_clip[:, :2] / w
+        u = (pts_ndc[:, 0] + 1) * 0.5 * self.image_width
+        v = (1 - pts_ndc[:, 1]) * 0.5 * self.image_height
+        return torch.stack([u, v], dim=1)
+
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
         self.image_width = width
