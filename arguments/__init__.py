@@ -28,12 +28,14 @@ class ParamGroup:
             value = value if not fill_none else None 
             if shorthand:
                 if t == bool:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
+                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true", dest=key)
+                    group.add_argument("--no-" + key, default=value, action="store_false", dest=key)
                 else:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
             else:
                 if t == bool:
-                    group.add_argument("--" + key, default=value, action="store_true")
+                    group.add_argument("--" + key, default=value, action="store_true", dest=key)
+                    group.add_argument("--no-" + key, default=value, action="store_false", dest=key)
                 else:
                     group.add_argument("--" + key, default=value, type=t)
 
@@ -109,7 +111,7 @@ class OptimizationParams(ParamGroup):
         self._global_local = True
         self.global_local_switch_iter = 7000
         self._coarse_to_fine = True
-        self.coarse_to_fine_schedule = "0.25,0.5,1.0"
+        self.coarse_to_fine_schedule = "4.0,2.0,1.0"
         self.coarse_to_fine_iters = "3000,7000,15000"
 
         self.scale_scheduler = True
