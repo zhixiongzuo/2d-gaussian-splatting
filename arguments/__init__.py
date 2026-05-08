@@ -98,11 +98,11 @@ class OptimizationParams(ParamGroup):
         self.z_ordering_interval = 1000
         self.splat_bounding = True
         self.splat_bounding_ratio = 10.0
-        self._vcd = True
+        self.vcd = True
         self.vcd_K = 3
         self.vcd_error_threshold = 0.2
         self.vcd_score_threshold = 0.5
-        self._vcp = True
+        self.vcp = True
         self.vcp_K = 3
         self.vcp_error_threshold = 0.2
         self.vcp_score_threshold = 1.0
