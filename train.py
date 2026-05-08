@@ -12,7 +12,7 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, ssim, fast_ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -22,17 +22,39 @@ from tqdm import tqdm
 from utils.image_utils import psnr, render_net_image
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from utils.accel_utils import (
+    compute_vcd_score, compute_vcp_score,
+    compute_edge_guided_densify_mask, compute_significance_prune_mask
+)
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
 
+def parse_schedule(schedule_str):
+    return [float(x) for x in schedule_str.split(",")]
+
+def parse_iters(iters_str):
+    return [int(x) for x in iters_str.split(",")]
+
+def get_coarse_to_fine_scale(iteration, schedule, iters):
+    scale = schedule[0]
+    for i, thresh in enumerate(iters):
+        if iteration >= thresh:
+            scale = schedule[min(i + 1, len(schedule) - 1)]
+    return scale
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians)
+
+    c2f_schedule = parse_schedule(opt.coarse_to_fine_schedule)
+    c2f_iters = parse_iters(opt.coarse_to_fine_iters)
+    resolution_scales = sorted(set(c2f_schedule), reverse=True)
+
+    scene = Scene(dataset, gaussians, resolution_scales=resolution_scales)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -49,6 +71,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_dist_for_log = 0.0
     ema_normal_for_log = 0.0
 
+    ssim_func = fast_ssim if opt.fast_ssim else ssim
+
+    if opt.coarse_to_fine:
+        print(f"[Coarse-to-Fine] Schedule: {c2f_schedule}, Iters: {c2f_iters}")
+    if opt.global_local:
+        print(f"[Global-to-Local] Switch at iter {opt.global_local_switch_iter}")
+    if opt.vcd:
+        print(f"[VCD] K={opt.vcd_K}, error_thresh={opt.vcd_error_threshold}, score_thresh={opt.vcd_score_threshold}")
+    if opt.vcp:
+        print(f"[VCP] K={opt.vcp_K}, error_thresh={opt.vcp_error_threshold}, score_thresh={opt.vcp_score_threshold}")
+    if opt.z_ordering:
+        print(f"[Z-Ordering] Interval={opt.z_ordering_interval}")
+    if opt.splat_bounding:
+        print(f"[Splat Bounding] Ratio={opt.splat_bounding_ratio}")
+    print(f"[Fast SSIM] {'ON' if opt.fast_ssim else 'OFF'}")
+    if opt.scale_scheduler:
+        print(f"[Scale Scheduler] start={opt.scale_scheduler_start}, cap={opt.scale_cap}")
+    if opt.long_axis_split:
+        print(f"[Long-Axis-Split] ON")
+    if opt.edge_guided_densify:
+        print(f"[Edge-Guided Densification] threshold_ratio={opt.edge_threshold_ratio}")
+    if opt.significance_prune:
+        print(f"[Significance Pruning] min_contribution={opt.min_contribution}")
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):        
@@ -57,23 +103,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+
+        if opt.coarse_to_fine:
+            current_scale = get_coarse_to_fine_scale(iteration, c2f_schedule, c2f_iters)
+            closest_scale = min(resolution_scales, key=lambda s: abs(s - current_scale))
+            if closest_scale in scene.train_cameras:
+                scaled_cams = scene.getTrainCameras(closest_scale)
+                if scaled_cams:
+                    viewpoint_cam = scaled_cams[randint(0, len(scaled_cams)-1)]
         
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
         
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_func(image, gt_image))
         
-        # regularization
         lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
         lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
 
@@ -84,7 +136,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         normal_loss = lambda_normal * (normal_error).mean()
         dist_loss = lambda_dist * (rend_dist).mean()
 
-        # loss
         total_loss = loss + dist_loss + normal_loss
         
         total_loss.backward()
@@ -92,11 +143,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_end.record()
 
         with torch.no_grad():
-            # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_dist_for_log = 0.4 * dist_loss.item() + 0.6 * ema_dist_for_log
             ema_normal_for_log = 0.4 * normal_loss.item() + 0.6 * ema_normal_for_log
-
 
             if iteration % 10 == 0:
                 loss_dict = {
@@ -111,7 +160,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Log and save
             if tb_writer is not None:
                 tb_writer.add_scalar('train_loss_patches/dist_loss', ema_dist_for_log, iteration)
                 tb_writer.add_scalar('train_loss_patches/normal_loss', ema_normal_for_log, iteration)
@@ -122,19 +170,114 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(iteration)
 
 
-            # Densification
             if iteration < opt.densify_until_iter:
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold)
-                
+                    use_vcd = opt.vcd
+                    use_global_local = opt.global_local
+
+                    vcd_score = None
+                    if use_vcd:
+                        vcd_score = compute_vcd_score(
+                            gaussians.get_xyz, gaussians.get_opacity, radii, visibility_filter,
+                            scene.getTrainCameras(), render, gaussians, pipe, background,
+                            K=opt.vcd_K, error_threshold=opt.vcd_error_threshold
+                        )
+
+                    if use_vcd and vcd_score is not None:
+                        gaussians.densify_and_prune_vcd(
+                            opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent,
+                            20 if iteration > opt.opacity_reset_interval else None,
+                            vcd_score=vcd_score, vcd_threshold=opt.vcd_score_threshold
+                        )
+                    elif use_global_local:
+                        grads = gaussians.xyz_gradient_accum / gaussians.denom
+                        grads[grads.isnan()] = 0.0
+                        phase = 'global' if iteration < opt.global_local_switch_iter else 'local'
+
+                        edge_densify_mask = None
+                        if opt.edge_guided_densify and iteration % 500 == 0 and iteration > 5000:
+                            try:
+                                edge_densify_mask, _ = compute_edge_guided_densify_mask(
+                                    gaussians, image, grads, opt.densify_grad_threshold, viewpoint_cam,
+                                    edge_threshold_ratio=opt.edge_threshold_ratio
+                                )
+                            except Exception:
+                                edge_densify_mask = None
+
+                        if opt.long_axis_split:
+                            if edge_densify_mask is not None:
+                                grads_masked = grads.clone()
+                                grads_masked[~edge_densify_mask] = 0.0
+                                gaussians.densify_and_split_long_axis(grads_masked, opt.densify_grad_threshold, scene.cameras_extent, N=2)
+                            else:
+                                gaussians.densify_and_split_long_axis(grads, opt.densify_grad_threshold, scene.cameras_extent, N=2)
+                        else:
+                            if edge_densify_mask is not None:
+                                grads_masked = grads.clone()
+                                grads_masked[~edge_densify_mask] = 0.0
+                                gaussians.densify_and_split(grads_masked, opt.densify_grad_threshold, scene.cameras_extent, N=2)
+                            else:
+                                gaussians.densify_and_split(grads, opt.densify_grad_threshold, scene.cameras_extent, N=2)
+
+                        if phase == 'local':
+                            if edge_densify_mask is not None:
+                                grads_clone = grads.clone()
+                                grads_clone[~edge_densify_mask] = 0.0
+                            else:
+                                grads_clone = grads
+                            gaussians.densify_and_clone(grads_clone, opt.densify_grad_threshold, scene.cameras_extent)
+
+                        if opt.significance_prune:
+                            prune_mask = compute_significance_prune_mask(
+                                gaussians, gaussians.max_radii2D,
+                                min_contribution=opt.min_contribution,
+                                min_opacity=opt.opacity_cull
+                            )
+                        else:
+                            prune_mask = (gaussians.get_opacity < opt.opacity_cull).squeeze()
+
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        if size_threshold:
+                            big_points_vs = gaussians.max_radii2D > size_threshold
+                            big_points_ws = gaussians.get_scaling.max(dim=1).values > 0.1 * scene.cameras_extent
+                            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+                        gaussians.prune_points(prune_mask)
+                        torch.cuda.empty_cache()
+                    else:
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold)
+
+                    if opt.vcp and iteration > opt.global_local_switch_iter:
+                        vcp_score = compute_vcp_score(
+                            gaussians.get_xyz, gaussians.get_opacity, radii, visibility_filter,
+                            scene.getTrainCameras(), render, gaussians, pipe, background,
+                            K=opt.vcp_K, error_threshold=opt.vcp_error_threshold
+                        )
+                        gaussians.prune_vcp(
+                            vcp_score, opt.vcp_score_threshold, opt.opacity_cull,
+                            scene.cameras_extent,
+                            20 if iteration > opt.opacity_reset_interval else None
+                        )
+
+                    if opt.splat_bounding:
+                        gaussians.apply_splat_bounding()
+
+                    if opt.scale_scheduler and iteration > opt.scale_scheduler_start:
+                        gaussians.apply_scale_scheduler(
+                            iteration,
+                            scheduler_start=opt.scale_scheduler_start,
+                            scale_cap=opt.scale_cap
+                        )
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
-            # Optimizer step
+                if opt.z_ordering and iteration % opt.z_ordering_interval == 0:
+                    gaussians.apply_z_ordering()
+
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
@@ -157,14 +300,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     metrics_dict = {
                         "#": gaussians.get_opacity.shape[0],
                         "loss": ema_loss_for_log
-                        # Add more metrics as needed
                     }
-                    # Send the data
                     network_gui.send(net_image_bytes, dataset.source_path, metrics_dict)
                     if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
                         break
                 except Exception as e:
-                    # raise e
                     network_gui.conn = None
 
 def prepare_output_and_logger(args):    
@@ -172,16 +312,14 @@ def prepare_output_and_logger(args):
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
-            unique_str = str(uuid.uuid4())
+            unique_str = str(uuid.uuid1())
         args.model_path = os.path.join("./output/", unique_str[0:10])
         
-    # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
-    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
+    with open(os.path.join(args.model_path, 'cfg_args'), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
-    # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(args.model_path)
@@ -197,7 +335,6 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         tb_writer.add_scalar('iter_time', elapsed, iteration)
         tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
 
-    # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
@@ -250,7 +387,6 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
-    # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
@@ -268,13 +404,10 @@ if __name__ == "__main__":
     
     print("Optimizing " + args.model_path)
 
-    # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint)
 
-    # All done
     print("\nTraining complete.")

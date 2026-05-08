@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
+from utils.fast_ssim import ssim as _fast_ssim
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
@@ -71,4 +72,7 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
         return ssim_map.mean()
     else:
         return ssim_map.mean(1).mean(1).mean(1)
+
+def fast_ssim(img1, img2, window_size=11, size_average=True):
+    return _fast_ssim(img1, img2, window_size, size_average)
 
